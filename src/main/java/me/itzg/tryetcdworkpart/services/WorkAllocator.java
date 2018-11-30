@@ -14,12 +14,14 @@ import static me.itzg.tryetcdworkpart.Bits.isNewKeyEvent;
 import static me.itzg.tryetcdworkpart.Bits.isUpdateKeyEvent;
 
 import com.coreos.jetcd.Client;
+import com.coreos.jetcd.Lease;
 import com.coreos.jetcd.Watch.Watcher;
 import com.coreos.jetcd.common.exception.ClosedClientException;
 import com.coreos.jetcd.data.ByteSequence;
 import com.coreos.jetcd.data.KeyValue;
 import com.coreos.jetcd.kv.DeleteResponse;
 import com.coreos.jetcd.kv.GetResponse;
+import com.coreos.jetcd.lease.LeaseKeepAliveResponse;
 import com.coreos.jetcd.op.Cmp;
 import com.coreos.jetcd.op.CmpTarget;
 import com.coreos.jetcd.options.DeleteOption;
@@ -67,7 +69,7 @@ public class WorkAllocator implements SmartLifecycle {
   private Deque<String> ourWork = new ConcurrentLinkedDeque<>();
   private ScheduledFuture<?> schedule;
   private ScheduledFuture<?> scheduledRebalance;
-
+  private Lease.KeepAliveListener keepAliveListener;
   @Autowired
   public WorkAllocator(WorkerProperties properties, Client etcd, WorkProcessor processor,
       ThreadPoolTaskScheduler taskScheduler) {
@@ -97,7 +99,7 @@ public class WorkAllocator implements SmartLifecycle {
   public void start() {
     ourId = UUID.randomUUID().toString();
     log.info("I am worker={}", ourId);
-
+    log.info("lease duration = {}", properties.getLeaseDuration().getSeconds());
     running = true;
 
     etcd.getLeaseClient()
@@ -105,7 +107,27 @@ public class WorkAllocator implements SmartLifecycle {
         .thenApply(leaseGrantResponse -> {
           leaseId = leaseGrantResponse.getID();
           log.info("Got lease={}", ourId, leaseId);
-          etcd.getLeaseClient().keepAlive(leaseId);
+          log.info("Got lease ttl={}", leaseGrantResponse.getTTL());
+          keepAliveListener = etcd.getLeaseClient().keepAlive(leaseId);
+          taskScheduler.submit(() -> {
+              log.info("listening to keepalive {}", leaseId);
+              while (true) {
+                try {
+                  final LeaseKeepAliveResponse resp = keepAliveListener.listen();
+                  log.info("resp ttl is {}", resp.getTTL());
+                } catch (ClosedClientException e) {
+                  log.debug("Stopping listening of {}", leaseId);
+                  return;
+                } catch (InterruptedException e) {
+                  log.debug("Interrupted while listening {}", leaseId);
+                } catch (com.coreos.jetcd.common.exception.ClosedKeepAliveListenerException e) {
+                  log.debug("keepAlive connection already closed.");
+                } catch (Exception e) {
+                  log.warn("Failed while listening {}", leaseId, e);
+                  return;
+                }
+              }
+              });
           return leaseId;
         })
         .thenCompose(leaseId ->
@@ -149,12 +171,14 @@ public class WorkAllocator implements SmartLifecycle {
 
       it.remove();
     }
-
-    etcd.getLeaseClient()
-        .revoke(leaseId)
-        .thenAccept(resp -> {
-          callback.run();
-        });
+    keepAliveListener.close();
+    try {
+      etcd.getLeaseClient()
+          .revoke(leaseId).get();
+    } catch(Exception e) {
+      log.warn("Revoke generated exception" + e.toString());
+    }
+    callback.run();
   }
 
   @Override
