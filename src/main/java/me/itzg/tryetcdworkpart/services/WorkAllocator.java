@@ -120,8 +120,10 @@ public class WorkAllocator implements SmartLifecycle {
                   return;
                 } catch (InterruptedException e) {
                   log.debug("Interrupted while listening {}", leaseId);
+                  return;
                 } catch (com.coreos.jetcd.common.exception.ClosedKeepAliveListenerException e) {
                   log.debug("keepAlive connection already closed.");
+                  return;
                 } catch (Exception e) {
                   log.warn("Failed while listening {}", leaseId, e);
                   return;
